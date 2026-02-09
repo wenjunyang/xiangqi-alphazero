@@ -12,11 +12,10 @@ AlphaZero训练框架
 使用方法：
     python train.py --iterations 100 --games-per-iter 20 --simulations 200
 
-改进说明（v2）：
-- 超步数时使用材料差判定胜负，避免训练早期全和棋
-- 增加 resign（认输）机制：当价值评估持续极低时提前结束
-- 优化 quick 模式参数，使短时间训练也能产生有效信号
-- 增加随机开局变体，增加训练数据多样性
+版本历史：
+- v1: 基础 AlphaZero 训练循环
+- v2: 材料差判定、认输机制、随机开局、温度退火
+- v3: 多进程并行自对弈和评估，大幅降低训练耗时
 """
 
 import os
@@ -39,6 +38,7 @@ from torch.utils.data import Dataset, DataLoader
 from game import XiangqiGame, ACTION_SPACE, decode_action, PIECE_NAMES
 from model import XiangqiNet, count_parameters
 from mcts import MCTS
+from parallel_selfplay import parallel_self_play, parallel_evaluate
 
 # 配置日志
 logging.basicConfig(
@@ -67,7 +67,7 @@ class TrainingConfig:
 
         # 自对弈参数
         self.num_games_per_iter = 20  # 每轮自对弈局数
-        self.max_game_length = 300    # 最大游戏步数（增加到300步）
+        self.max_game_length = 300    # 最大游戏步数
 
         # 认输机制
         self.resign_threshold = -0.9  # 价值低于此阈值时考虑认输
@@ -77,18 +77,22 @@ class TrainingConfig:
         # 随机开局
         self.random_opening_moves = 4  # 前N步随机走法（增加多样性）
 
+        # 并行参数
+        self.num_workers = None       # 并行 worker 数量，None=自动检测
+        self.parallel = True          # 是否启用并行自对弈
+
         # 训练参数
         self.num_iterations = 100     # 总训练轮数
         self.batch_size = 256         # 批大小
         self.num_epochs = 5           # 每轮训练epoch数
-        self.learning_rate = 0.002    # 学习率（稍高以加速早期学习）
+        self.learning_rate = 0.002    # 学习率
         self.weight_decay = 1e-4      # L2正则化
         self.lr_milestones = [50, 80] # 学习率衰减节点
         self.lr_gamma = 0.1           # 学习率衰减因子
 
         # 数据管理
         self.max_buffer_size = 50000  # 经验回放缓冲区大小
-        self.min_buffer_size = 500    # 开始训练的最小数据量（降低门槛）
+        self.min_buffer_size = 500    # 开始训练的最小数据量
 
         # 评估参数
         self.eval_games = 10          # 评估对弈局数
@@ -124,19 +128,15 @@ class SelfPlayDataset(Dataset):
 def augment_data(state: np.ndarray, policy: np.ndarray, value: float) -> List[Tuple]:
     """
     数据增强：中国象棋棋盘可以左右镜像翻转
-
-    注意：由于中国象棋棋盘不是正方形，只能做水平翻转
     """
     augmented = [(state, policy, value)]
 
-    # 水平翻转
-    flipped_state = np.flip(state, axis=2).copy()  # 沿列翻转
+    flipped_state = np.flip(state, axis=2).copy()
     flipped_policy = np.zeros_like(policy)
 
     for action_idx in range(ACTION_SPACE):
         if policy[action_idx] > 0:
             fr, fc, tr, tc = decode_action(action_idx)
-            # 翻转列坐标
             new_fc = 8 - fc
             new_tc = 8 - tc
             from game import encode_action
@@ -148,10 +148,7 @@ def augment_data(state: np.ndarray, policy: np.ndarray, value: float) -> List[Tu
 
 
 def make_random_opening(game: XiangqiGame, num_moves: int) -> XiangqiGame:
-    """
-    执行随机开局走法，增加训练数据多样性。
-    随机从合法走法中选择前几步。
-    """
+    """执行随机开局走法"""
     for _ in range(num_moves):
         legal_moves = game.get_legal_moves()
         if not legal_moves:
@@ -165,7 +162,7 @@ def make_random_opening(game: XiangqiGame, num_moves: int) -> XiangqiGame:
 
 
 class AlphaZeroTrainer:
-    """AlphaZero训练器"""
+    """AlphaZero训练器（支持多进程并行）"""
 
     def __init__(self, config: TrainingConfig):
         self.config = config
@@ -209,18 +206,25 @@ class AlphaZeroTrainer:
         # 创建保存目录
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
+        # 检测并行能力
+        cpu_count = os.cpu_count() or 1
+        if config.num_workers is None:
+            self.num_workers = min(cpu_count - 1, config.num_games_per_iter)
+            self.num_workers = max(self.num_workers, 1)
+        else:
+            self.num_workers = config.num_workers
+
         logger.info(f"设备: {self.device}")
         logger.info(f"模型参数量: {count_parameters(self.current_model):,}")
+        logger.info(f"CPU 核心数: {cpu_count}, 并行 workers: {self.num_workers}")
+        logger.info(f"并行模式: {'启用' if config.parallel else '禁用'}")
 
-    def self_play_game(self) -> List[Tuple[np.ndarray, np.ndarray, int]]:
+    def self_play_game(self) -> Tuple[List, int, int]:
         """
-        执行一局自对弈
-
-        返回: [(state, action_probs, current_player), ...], winner, steps
+        执行一局自对弈（串行模式，用于回退或调试）
         """
         game = XiangqiGame()
 
-        # 随机开局增加多样性
         if self.config.random_opening_moves > 0:
             num_random = random.randint(0, self.config.random_opening_moves)
             game = make_random_opening(game, num_random)
@@ -234,42 +238,34 @@ class AlphaZeroTrainer:
 
         game_data = []
         step = 0
-        resign_counter = 0  # 连续低价值步数计数
+        resign_counter = 0
+        done = False
 
         while step < self.config.max_game_length:
-            # 温度调度：前N步高温探索，之后逐渐降低
             if step < self.config.temperature_threshold:
                 temperature = 1.0
             elif step < self.config.temperature_threshold + 10:
-                # 线性降温
                 temperature = 1.0 - 0.9 * (step - self.config.temperature_threshold) / 10
             else:
                 temperature = 0.1
 
-            # MCTS搜索
             action_probs = mcts.search(game, temperature=temperature, add_noise=True)
-
-            # 保存训练数据
             state = game.get_state_for_nn()
             game_data.append((state, action_probs, game.current_player))
 
-            # 选择动作
             if temperature > 0.05:
                 action = np.random.choice(len(action_probs), p=action_probs)
             else:
                 action = np.argmax(action_probs)
 
-            # 执行动作
             fr, fc, tr, tc = decode_action(action)
             game.make_move(fr, fc, tr, tc)
             step += 1
 
-            # 检查游戏是否结束
             done, winner = game.is_game_over()
             if done:
                 break
 
-            # 认输机制：如果网络评估持续极低，提前结束
             if self.config.enable_resign and step > 40:
                 eval_state = game.get_state_for_nn()
                 _, value = self.best_model.predict(eval_state, self.device)
@@ -277,20 +273,16 @@ class AlphaZeroTrainer:
                     resign_counter += 1
                 else:
                     resign_counter = 0
-
                 if resign_counter >= self.config.resign_check_steps:
-                    # 当前玩家认输
                     winner = -game.current_player
                     done = True
                     break
 
-        # 确定最终结果
         if not done:
             done, winner = game.is_game_over()
         if winner is None:
-            winner = 0  # 安全回退
+            winner = 0
 
-        # 将结果分配给每一步
         training_data = []
         for state, action_probs, player in game_data:
             if winner == 0:
@@ -304,8 +296,32 @@ class AlphaZeroTrainer:
         return training_data, winner, step
 
     def self_play(self) -> dict:
-        """执行一轮自对弈"""
-        logger.info(f"开始自对弈: {self.config.num_games_per_iter} 局")
+        """
+        执行一轮自对弈。
+        根据 config.parallel 选择并行或串行模式。
+        """
+        if self.config.parallel and self.num_workers > 1:
+            return self._parallel_self_play()
+        else:
+            return self._serial_self_play()
+
+    def _parallel_self_play(self) -> dict:
+        """并行自对弈"""
+        all_data, stats = parallel_self_play(
+            model=self.best_model,
+            config=self.config,
+            num_workers=self.num_workers,
+        )
+
+        self.replay_buffer.extend(all_data)
+        self.total_games += stats['games']
+        stats['buffer_size'] = len(self.replay_buffer)
+
+        return stats
+
+    def _serial_self_play(self) -> dict:
+        """串行自对弈（回退模式）"""
+        logger.info(f"开始串行自对弈: {self.config.num_games_per_iter} 局")
 
         all_data = []
         results = {1: 0, -1: 0, 0: 0}
@@ -316,7 +332,6 @@ class AlphaZeroTrainer:
             game_data, winner, steps = self.self_play_game()
             elapsed = time.time() - start_time
 
-            # 数据增强
             for state, policy, value in game_data:
                 augmented = augment_data(state, policy, value)
                 all_data.extend(augmented)
@@ -331,7 +346,6 @@ class AlphaZeroTrainer:
                 f"耗时={elapsed:.1f}s"
             )
 
-        # 添加到回放缓冲区
         self.replay_buffer.extend(all_data)
 
         stats = {
@@ -341,11 +355,11 @@ class AlphaZeroTrainer:
             'draws': results.get(0, 0),
             'avg_steps': total_steps / self.config.num_games_per_iter,
             'buffer_size': len(self.replay_buffer),
-            'new_samples': len(all_data)
+            'new_samples': len(all_data),
         }
 
         logger.info(
-            f"自对弈完成: 红胜={stats['red_wins']}, 黑胜={stats['black_wins']}, "
+            f"串行自对弈完成: 红胜={stats['red_wins']}, 黑胜={stats['black_wins']}, "
             f"和={stats['draws']}, 平均步数={stats['avg_steps']:.1f}, "
             f"新样本={stats['new_samples']}, 缓冲区={stats['buffer_size']}"
         )
@@ -360,7 +374,6 @@ class AlphaZeroTrainer:
 
         logger.info(f"开始训练: {self.config.num_epochs} epochs, 数据量={len(self.replay_buffer)}")
 
-        # 创建数据集
         dataset = SelfPlayDataset(list(self.replay_buffer))
         dataloader = DataLoader(
             dataset,
@@ -373,7 +386,6 @@ class AlphaZeroTrainer:
         self.current_model.train()
         total_policy_loss = 0
         total_value_loss = 0
-        total_loss = 0
         num_batches = 0
 
         for epoch in range(self.config.num_epochs):
@@ -386,24 +398,16 @@ class AlphaZeroTrainer:
                 target_policies = target_policies.to(self.device)
                 target_values = target_values.to(self.device)
 
-                # 前向传播
                 policy_logits, pred_values = self.current_model(states)
 
-                # 策略损失（交叉熵）
                 policy_loss = -torch.mean(
                     torch.sum(target_policies * F.log_softmax(policy_logits, dim=1), dim=1)
                 )
-
-                # 价值损失（MSE）
                 value_loss = F.mse_loss(pred_values, target_values)
-
-                # 总损失
                 loss = policy_loss + value_loss
 
-                # 反向传播
                 self.optimizer.zero_grad()
                 loss.backward()
-                # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
                 self.optimizer.step()
 
@@ -436,8 +440,36 @@ class AlphaZeroTrainer:
         return stats
 
     def evaluate(self) -> dict:
-        """评估新模型 vs 旧模型"""
-        logger.info(f"开始评估: {self.config.eval_games} 局")
+        """
+        评估新模型 vs 旧模型。
+        根据 config.parallel 选择并行或串行模式。
+        """
+        if self.config.parallel and self.num_workers > 1:
+            return self._parallel_evaluate()
+        else:
+            return self._serial_evaluate()
+
+    def _parallel_evaluate(self) -> dict:
+        """并行评估"""
+        stats = parallel_evaluate(
+            new_model=self.current_model,
+            old_model=self.best_model,
+            config=self.config,
+            num_workers=self.num_workers,
+        )
+
+        if stats['model_updated']:
+            self.best_model.load_state_dict(self.current_model.state_dict())
+            logger.info(">>> 最优模型已更新！<<<")
+        else:
+            self.current_model.load_state_dict(self.best_model.state_dict())
+            logger.info("新模型未达标，回退到旧模型")
+
+        return stats
+
+    def _serial_evaluate(self) -> dict:
+        """串行评估（回退模式）"""
+        logger.info(f"开始串行评估: {self.config.eval_games} 局")
 
         new_mcts = MCTS(
             self.current_model,
@@ -458,8 +490,6 @@ class AlphaZeroTrainer:
 
         for game_idx in range(self.config.eval_games):
             game = XiangqiGame()
-
-            # 交替先手
             new_is_red = (game_idx % 2 == 0)
 
             step = 0
@@ -512,7 +542,6 @@ class AlphaZeroTrainer:
             f"和={draws}, 胜率={win_rate:.2%}"
         )
 
-        # 更新最优模型
         if stats['model_updated']:
             self.best_model.load_state_dict(self.current_model.state_dict())
             logger.info(">>> 最优模型已更新！<<<")
@@ -573,8 +602,9 @@ class AlphaZeroTrainer:
         logger.info(f"配置: channels={self.config.num_channels}, "
                      f"res_blocks={self.config.num_res_blocks}, "
                      f"simulations={self.config.num_simulations}")
-        logger.info(f"改进: 材料判定={True}, 认输={self.config.enable_resign}, "
-                     f"随机开局={self.config.random_opening_moves}步")
+        logger.info(f"改进: 材料判定=True, 认输={self.config.enable_resign}, "
+                     f"随机开局={self.config.random_opening_moves}步, "
+                     f"并行={self.config.parallel}({self.num_workers} workers)")
         logger.info("=" * 60)
 
         for iteration in range(self.iteration + 1, self.config.num_iterations + 1):
@@ -585,13 +615,13 @@ class AlphaZeroTrainer:
 
             iter_start = time.time()
 
-            # 1. 自对弈
+            # 1. 自对弈（并行或串行）
             sp_stats = self.self_play()
 
             # 2. 训练网络
             train_stats = self.train_network()
 
-            # 3. 评估（每隔几轮评估一次以节省时间）
+            # 3. 评估（每隔几轮评估一次）
             eval_stats = {}
             if iteration % 2 == 0 and len(self.replay_buffer) >= self.config.min_buffer_size:
                 eval_stats = self.evaluate()
@@ -625,35 +655,39 @@ class AlphaZeroTrainer:
         logger.info("\n训练完成！")
 
 
+# ============================================================
+# 预设训练模式
+# ============================================================
+
 def quick_train():
     """
     快速训练模式（用于测试和演示）
 
-    关键改进：
-    - max_game_length 增加到 200，给足对局空间
-    - 启用认输机制，避免无意义的长对局
-    - 随机开局 0-4 步，增加数据多样性
-    - 降低 min_buffer_size，更早开始训练
+    关键特性：
+    - 多进程并行自对弈，充分利用多核 CPU
+    - 材料差判定 + 认输机制，避免全和棋
+    - 随机开局增加数据多样性
     """
     config = TrainingConfig()
     config.num_channels = 64
     config.num_res_blocks = 3
-    config.num_simulations = 80       # 增加到80次（原50次太少）
+    config.num_simulations = 80
     config.num_games_per_iter = 6
     config.num_iterations = 10
     config.batch_size = 64
-    config.num_epochs = 5             # 增加到5个epoch
-    config.min_buffer_size = 100      # 降低门槛，更早开始训练
+    config.num_epochs = 5
+    config.min_buffer_size = 100
     config.eval_games = 4
     config.eval_simulations = 40
     config.save_interval = 2
     config.temperature_threshold = 15
-    config.max_game_length = 200      # 增加到200步（关键改进）
-    config.learning_rate = 0.002      # 稍高学习率加速早期学习
-    config.random_opening_moves = 4   # 随机开局增加多样性
-    config.enable_resign = True       # 启用认输
+    config.max_game_length = 200
+    config.learning_rate = 0.002
+    config.random_opening_moves = 4
+    config.enable_resign = True
     config.resign_threshold = -0.85
     config.resign_check_steps = 3
+    config.parallel = True
     return config
 
 
@@ -668,6 +702,7 @@ def standard_train():
     config.max_game_length = 300
     config.random_opening_moves = 6
     config.enable_resign = True
+    config.parallel = True
     return config
 
 
@@ -682,6 +717,7 @@ def full_train():
     config.max_game_length = 400
     config.random_opening_moves = 8
     config.enable_resign = True
+    config.parallel = True
     return config
 
 
@@ -697,6 +733,8 @@ def main():
     parser.add_argument('--res-blocks', type=int, default=None, help='残差块数量')
     parser.add_argument('--resume', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--device', type=str, default=None, help='计算设备 (cpu/cuda)')
+    parser.add_argument('--workers', type=int, default=None, help='并行 worker 数量')
+    parser.add_argument('--no-parallel', action='store_true', help='禁用并行自对弈')
 
     args = parser.parse_args()
 
@@ -705,7 +743,7 @@ def main():
         config = quick_train()
     elif args.mode == 'standard':
         config = standard_train()
-    else:  # full
+    else:
         config = full_train()
 
     # 覆盖命令行参数
@@ -721,6 +759,10 @@ def main():
         config.num_res_blocks = args.res_blocks
     if args.device:
         config.device = args.device
+    if args.workers:
+        config.num_workers = args.workers
+    if args.no_parallel:
+        config.parallel = False
 
     # 创建训练器
     trainer = AlphaZeroTrainer(config)
