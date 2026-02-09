@@ -109,28 +109,53 @@ UCB(s, a) = Q(s, a) + c_puct × P(s, a) × √N(s) / (1 + N(s, a))
 
 完整的 AlphaZero 训练循环，包含以下改进机制：
 
-- **多进程并行自对弈**：使用 `ProcessPoolExecutor` + `spawn` 上下文，充分利用多核 CPU，加速比接近 worker 数量
+- **三级并行自对弈**：进程级 × 对局级 × 搜索级（Virtual Loss）三级并行，专为高核数机器（如 128 核）设计
 - **材料差判定**：超步数时根据双方棋子材料分差判定胜负，避免训练早期全部和棋
 - **认输机制**：当价值网络连续评估极低时提前结束对局，节省训练时间
 - **随机开局**：前 0-N 步随机走法，增加训练数据多样性
 - **温度退火**：温度从 1.0 线性降至 0.1，平衡探索与利用
 
-### 1.5 并行自对弈 (`training/parallel_selfplay.py`)
+### 1.5 MCTS 并行优化 (`training/mcts.py`)
 
-使用 Python `multiprocessing` 实现多进程并行自对弈，充分利用多核 CPU 加速训练数据生成。
+MCTS 实现了三种模式，逐步提升并行度：
 
-**设计要点**：
-- 主进程将模型权重序列化后传递给子进程，每个子进程独立重建模型实例
-- 使用 `spawn` 上下文创建进程，避免 `fork` 导致的锁问题
-- 每个 worker 限制 PyTorch 单线程（`OMP_NUM_THREADS=1`），避免 CPU 过载
-- 支持自动检测 CPU 核心数，动态调整 worker 数量
+| 类 | 模式 | 说明 |
+|------|------|------|
+| `MCTS` | 串行 | 每次模拟单独调用神经网络，兼容旧接口 |
+| `BatchMCTS` | Virtual Loss + 批量推理 | 多条路径并行搜索，收集叶节点后批量推理 |
+| `MultiGameBatchMCTS` | 多对局 + VL + 批量推理 | 同时推进 N 局对弈，所有叶节点合并批量推理 |
 
-**性能基准**（测试环境: 6核 CPU, 64通道/3残差块, 30次模拟）：
+**Virtual Loss 原理**：在一次 MCTS search 中同时从根节点出发执行 N 条路径的选择。每条路径选择后对经过的节点施加 Virtual Loss（临时减少其 Q 值），使后续路径倾向于探索不同分支。所有路径到达叶节点后，打包成一个 batch 送入神经网络批量推理，然后撤销 Virtual Loss 并用真实值回溯。
 
-| 模式 | 局数 | 耗时 | 加速比 |
-|------|------|------|--------|
-| 串行 | 2 | 173s | 1.0x |
-| 并行 (5 workers) | 6 | 173s | ~3.0x |
+### 1.6 三级并行自对弈 (`training/parallel_selfplay.py`)
+
+专为高核数机器（如 128 核）设计的三级并行架构：
+
+```
+Level 1 - 进程级并行（多进程）
+│  P 个 worker 进程，每个进程分配多个线程做矩阵运算
+│
+Level 2 - 对局级并行（多对局批量 MCTS）
+│  每个 worker 内同时推进 G 局对弈
+│  所有对局的 MCTS 叶节点合并做批量推理
+│
+Level 3 - 搜索级并行（Virtual Loss）
+   每局 MCTS 使用 VL 并行搜索 V 条路径
+   不同路径被分散到不同分支
+
+总并行度 = P × G × V
+```
+
+**128 核机器推荐配置**：
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| `--workers` | 32 | 32 个进程，每进程 4 线程 |
+| `--games-per-worker` | 4 | 每进程同时 4 局 |
+| `--vl-batch-size` | 8 | 每局 VL 并行 8 条路径 |
+| 总并行度 | ~1024 | 32×4×8 |
+| 同时对局数 | 128 | 32×4 |
+| 每次批量推理 | 32 | 4×8 个状态/进程 |
 
 训练循环结构：
 
@@ -196,6 +221,7 @@ python training/train.py --mode full             # 默认启用并行
 **自定义参数**：
 
 ```bash
+# 基础自定义
 python training/train.py \
     --mode standard \
     --iterations 100 \
@@ -205,6 +231,15 @@ python training/train.py \
     --res-blocks 10 \
     --workers 8 \
     --device cuda
+
+# 128 核机器推荐配置（三级并行）
+python training/train.py \
+    --mode full \
+    --games-per-iter 128 \
+    --workers 32 \
+    --games-per-worker 4 \
+    --vl-batch-size 8 \
+    --device cpu
 
 # 禁用并行（调试用）
 python training/train.py --mode quick --no-parallel
@@ -227,7 +262,9 @@ python training/train.py --resume models/checkpoint_iter50.pt
 | `--channels` | 视模式 | 网络通道数 |
 | `--res-blocks` | 视模式 | 残差块数量 |
 | `--device` | auto | 计算设备 (cpu/cuda) |
-| `--workers` | auto | 并行 worker 数量（默认=CPU核心数-1） |
+| `--workers` | auto | 并行 worker 进程数（默认=自动计算） |
+| `--vl-batch-size` | auto | Virtual Loss 批大小（对局内并行度） |
+| `--games-per-worker` | auto | 每个 worker 同时推进的对局数 |
 | `--no-parallel` | false | 禁用并行自对弈 |
 | `--resume` | None | 恢复训练的检查点路径 |
 

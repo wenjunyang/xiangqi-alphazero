@@ -80,6 +80,8 @@ class TrainingConfig:
         # 并行参数
         self.num_workers = None       # 并行 worker 数量，None=自动检测
         self.parallel = True          # 是否启用并行自对弈
+        self.vl_batch_size = None     # Virtual Loss 批大小，None=自动
+        self.games_per_worker = None  # 每个 worker 同时推进的对局数，None=自动
 
         # 训练参数
         self.num_iterations = 100     # 总训练轮数
@@ -734,6 +736,8 @@ def main():
     parser.add_argument('--resume', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--device', type=str, default=None, help='计算设备 (cpu/cuda)')
     parser.add_argument('--workers', type=int, default=None, help='并行 worker 数量')
+    parser.add_argument('--vl-batch-size', type=int, default=None, help='Virtual Loss 批大小（对局内并行度）')
+    parser.add_argument('--games-per-worker', type=int, default=None, help='每个 worker 同时推进的对局数')
     parser.add_argument('--no-parallel', action='store_true', help='禁用并行自对弈')
 
     args = parser.parse_args()
@@ -761,6 +765,10 @@ def main():
         config.device = args.device
     if args.workers:
         config.num_workers = args.workers
+    if args.vl_batch_size:
+        config.vl_batch_size = args.vl_batch_size
+    if args.games_per_worker:
+        config.games_per_worker = args.games_per_worker
     if args.no_parallel:
         config.parallel = False
 
