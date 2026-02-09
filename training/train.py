@@ -15,7 +15,7 @@ AlphaZero训练框架
 版本历史：
 - v1: 基础 AlphaZero 训练循环
 - v2: 材料差判定、认输机制、随机开局、温度退火
-- v3: 多进程并行自对弈和评估，大幅降低训练耗时
+- v3: 多进程并行自对弈，大幅降低训练耗时
 """
 
 import os
@@ -38,7 +38,7 @@ from torch.utils.data import Dataset, DataLoader
 from game import XiangqiGame, ACTION_SPACE, decode_action, PIECE_NAMES
 from model import XiangqiNet, count_parameters
 from mcts import MCTS
-from parallel_selfplay import parallel_self_play, parallel_evaluate
+from parallel_selfplay import parallel_self_play
 
 # 配置日志
 logging.basicConfig(
@@ -80,8 +80,6 @@ class TrainingConfig:
         # 并行参数
         self.num_workers = None       # 并行 worker 数量，None=自动检测
         self.parallel = True          # 是否启用并行自对弈
-        self.vl_batch_size = None     # Virtual Loss 批大小，None=自动
-        self.games_per_worker = None  # 每个 worker 同时推进的对局数，None=自动
 
         # 训练参数
         self.num_iterations = 100     # 总训练轮数
@@ -442,32 +440,8 @@ class AlphaZeroTrainer:
         return stats
 
     def evaluate(self) -> dict:
-        """
-        评估新模型 vs 旧模型。
-        根据 config.parallel 选择并行或串行模式。
-        """
-        if self.config.parallel and self.num_workers > 1:
-            return self._parallel_evaluate()
-        else:
-            return self._serial_evaluate()
-
-    def _parallel_evaluate(self) -> dict:
-        """并行评估"""
-        stats = parallel_evaluate(
-            new_model=self.current_model,
-            old_model=self.best_model,
-            config=self.config,
-            num_workers=self.num_workers,
-        )
-
-        if stats['model_updated']:
-            self.best_model.load_state_dict(self.current_model.state_dict())
-            logger.info(">>> 最优模型已更新！<<<")
-        else:
-            self.current_model.load_state_dict(self.best_model.state_dict())
-            logger.info("新模型未达标，回退到旧模型")
-
-        return stats
+        """评估新模型 vs 旧模型"""
+        return self._serial_evaluate()
 
     def _serial_evaluate(self) -> dict:
         """串行评估（回退模式）"""
@@ -736,8 +710,6 @@ def main():
     parser.add_argument('--resume', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--device', type=str, default=None, help='计算设备 (cpu/cuda)')
     parser.add_argument('--workers', type=int, default=None, help='并行 worker 数量')
-    parser.add_argument('--vl-batch-size', type=int, default=None, help='Virtual Loss 批大小（对局内并行度）')
-    parser.add_argument('--games-per-worker', type=int, default=None, help='每个 worker 同时推进的对局数')
     parser.add_argument('--no-parallel', action='store_true', help='禁用并行自对弈')
 
     args = parser.parse_args()
@@ -765,10 +737,6 @@ def main():
         config.device = args.device
     if args.workers:
         config.num_workers = args.workers
-    if args.vl_batch_size:
-        config.vl_batch_size = args.vl_batch_size
-    if args.games_per_worker:
-        config.games_per_worker = args.games_per_worker
     if args.no_parallel:
         config.parallel = False
 
