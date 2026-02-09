@@ -16,3 +16,10 @@ training/training.log
 .DS_Store
 *.swp
 *.swo
+
+# Web项目
+web/node_modules/
+web/dist/
+web/.manus-logs/
+web/.webdev/
+web/pnpm-lock.yaml
