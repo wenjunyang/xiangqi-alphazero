@@ -41,6 +41,12 @@ PIECE_NAMES = {
     -1: '将', -2: '士', -3: '象', -4: '马', -5: '车', -6: '炮', -7: '卒'
 }
 
+# 棋子价值（用于材料评估，帮助训练早期打破和棋僵局）
+PIECE_VALUES = {
+    1: 0, 2: 20, 3: 20, 4: 40, 5: 90, 6: 45, 7: 10,
+    -1: 0, -2: 20, -3: 20, -4: 40, -5: 90, -6: 45, -7: 10
+}
+
 ROWS = 10
 COLS = 9
 
@@ -398,6 +404,21 @@ class XiangqiGame:
         fr, fc, tr, tc = decode_action(action)
         return self.make_move(fr, fc, tr, tc)
 
+    def get_material_score(self, player: int) -> int:
+        """
+        计算指定方的材料总分
+        用于在超步数和棋时辅助判定胜负
+        """
+        score = 0
+        for r in range(ROWS):
+            for c in range(COLS):
+                piece = self.board[r][c]
+                if piece == 0:
+                    continue
+                if (player == 1 and piece > 0) or (player == -1 and piece < 0):
+                    score += PIECE_VALUES.get(abs(piece), 0)
+        return score
+
     def is_game_over(self) -> Tuple[bool, Optional[int]]:
         """
         检查游戏是否结束
@@ -421,9 +442,18 @@ class XiangqiGame:
         if self.no_capture_count >= 120:
             return True, 0
 
-        # 总步数超过200步判和
+        # 总步数超过限制 —— 使用材料差判定胜负而非直接判和
+        # 这是关键改进：避免训练早期所有对局都以和棋结束
         if self.move_count >= 200:
-            return True, 0
+            red_score = self.get_material_score(1)
+            black_score = self.get_material_score(-1)
+            diff = red_score - black_score
+            if diff > 30:  # 红方材料优势明显
+                return True, 1
+            elif diff < -30:  # 黑方材料优势明显
+                return True, -1
+            else:
+                return True, 0
 
         # 重复局面判和
         if len(self.history) >= 6:
@@ -512,3 +542,7 @@ if __name__ == "__main__":
         fr, fc, tr, tc = m
         piece = PIECE_NAMES[game.board[fr][fc]]
         print(f"  {piece} ({fr},{fc}) -> ({tr},{tc})")
+
+    # 测试材料评估
+    print(f"\n红方材料分: {game.get_material_score(1)}")
+    print(f"黑方材料分: {game.get_material_score(-1)}")

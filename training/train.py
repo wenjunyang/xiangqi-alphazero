@@ -11,6 +11,12 @@ AlphaZero训练框架
 
 使用方法：
     python train.py --iterations 100 --games-per-iter 20 --simulations 200
+
+改进说明（v2）：
+- 超步数时使用材料差判定胜负，避免训练早期全和棋
+- 增加 resign（认输）机制：当价值评估持续极低时提前结束
+- 优化 quick 模式参数，使短时间训练也能产生有效信号
+- 增加随机开局变体，增加训练数据多样性
 """
 
 import os
@@ -57,24 +63,32 @@ class TrainingConfig:
         # MCTS参数
         self.num_simulations = 200    # 每步MCTS模拟次数
         self.c_puct = 1.5             # 探索常数
-        self.temperature_threshold = 15  # 前N步使用温度=1，之后温度=0
+        self.temperature_threshold = 20  # 前N步使用温度=1，之后温度→0
 
         # 自对弈参数
         self.num_games_per_iter = 20  # 每轮自对弈局数
-        self.max_game_length = 200    # 最大游戏步数
+        self.max_game_length = 300    # 最大游戏步数（增加到300步）
+
+        # 认输机制
+        self.resign_threshold = -0.9  # 价值低于此阈值时考虑认输
+        self.resign_check_steps = 5   # 连续N步低于阈值才认输
+        self.enable_resign = True     # 是否启用认输
+
+        # 随机开局
+        self.random_opening_moves = 4  # 前N步随机走法（增加多样性）
 
         # 训练参数
         self.num_iterations = 100     # 总训练轮数
         self.batch_size = 256         # 批大小
         self.num_epochs = 5           # 每轮训练epoch数
-        self.learning_rate = 0.001    # 学习率
+        self.learning_rate = 0.002    # 学习率（稍高以加速早期学习）
         self.weight_decay = 1e-4      # L2正则化
         self.lr_milestones = [50, 80] # 学习率衰减节点
         self.lr_gamma = 0.1           # 学习率衰减因子
 
         # 数据管理
         self.max_buffer_size = 50000  # 经验回放缓冲区大小
-        self.min_buffer_size = 2000   # 开始训练的最小数据量
+        self.min_buffer_size = 500    # 开始训练的最小数据量（降低门槛）
 
         # 评估参数
         self.eval_games = 10          # 评估对弈局数
@@ -133,6 +147,23 @@ def augment_data(state: np.ndarray, policy: np.ndarray, value: float) -> List[Tu
     return augmented
 
 
+def make_random_opening(game: XiangqiGame, num_moves: int) -> XiangqiGame:
+    """
+    执行随机开局走法，增加训练数据多样性。
+    随机从合法走法中选择前几步。
+    """
+    for _ in range(num_moves):
+        legal_moves = game.get_legal_moves()
+        if not legal_moves:
+            break
+        move = random.choice(legal_moves)
+        game.make_move(*move)
+        done, _ = game.is_game_over()
+        if done:
+            break
+    return game
+
+
 class AlphaZeroTrainer:
     """AlphaZero训练器"""
 
@@ -185,9 +216,15 @@ class AlphaZeroTrainer:
         """
         执行一局自对弈
 
-        返回: [(state, action_probs, current_player), ...]
+        返回: [(state, action_probs, current_player), ...], winner, steps
         """
         game = XiangqiGame()
+
+        # 随机开局增加多样性
+        if self.config.random_opening_moves > 0:
+            num_random = random.randint(0, self.config.random_opening_moves)
+            game = make_random_opening(game, num_random)
+
         mcts = MCTS(
             self.best_model,
             num_simulations=self.config.num_simulations,
@@ -197,10 +234,17 @@ class AlphaZeroTrainer:
 
         game_data = []
         step = 0
+        resign_counter = 0  # 连续低价值步数计数
 
         while step < self.config.max_game_length:
-            # 前N步使用温度=1增加探索
-            temperature = 1.0 if step < self.config.temperature_threshold else 0.1
+            # 温度调度：前N步高温探索，之后逐渐降低
+            if step < self.config.temperature_threshold:
+                temperature = 1.0
+            elif step < self.config.temperature_threshold + 10:
+                # 线性降温
+                temperature = 1.0 - 0.9 * (step - self.config.temperature_threshold) / 10
+            else:
+                temperature = 0.1
 
             # MCTS搜索
             action_probs = mcts.search(game, temperature=temperature, add_noise=True)
@@ -210,7 +254,7 @@ class AlphaZeroTrainer:
             game_data.append((state, action_probs, game.current_player))
 
             # 选择动作
-            if temperature > 0:
+            if temperature > 0.05:
                 action = np.random.choice(len(action_probs), p=action_probs)
             else:
                 action = np.argmax(action_probs)
@@ -225,10 +269,26 @@ class AlphaZeroTrainer:
             if done:
                 break
 
+            # 认输机制：如果网络评估持续极低，提前结束
+            if self.config.enable_resign and step > 40:
+                eval_state = game.get_state_for_nn()
+                _, value = self.best_model.predict(eval_state, self.device)
+                if value < self.config.resign_threshold:
+                    resign_counter += 1
+                else:
+                    resign_counter = 0
+
+                if resign_counter >= self.config.resign_check_steps:
+                    # 当前玩家认输
+                    winner = -game.current_player
+                    done = True
+                    break
+
         # 确定最终结果
-        done, winner = game.is_game_over()
         if not done:
-            winner = 0  # 超过最大步数判和
+            done, winner = game.is_game_over()
+        if winner is None:
+            winner = 0  # 安全回退
 
         # 将结果分配给每一步
         training_data = []
@@ -513,6 +573,8 @@ class AlphaZeroTrainer:
         logger.info(f"配置: channels={self.config.num_channels}, "
                      f"res_blocks={self.config.num_res_blocks}, "
                      f"simulations={self.config.num_simulations}")
+        logger.info(f"改进: 材料判定={True}, 认输={self.config.enable_resign}, "
+                     f"随机开局={self.config.random_opening_moves}步")
         logger.info("=" * 60)
 
         for iteration in range(self.iteration + 1, self.config.num_iterations + 1):
@@ -564,21 +626,62 @@ class AlphaZeroTrainer:
 
 
 def quick_train():
-    """快速训练模式（用于测试和演示）"""
+    """
+    快速训练模式（用于测试和演示）
+
+    关键改进：
+    - max_game_length 增加到 200，给足对局空间
+    - 启用认输机制，避免无意义的长对局
+    - 随机开局 0-4 步，增加数据多样性
+    - 降低 min_buffer_size，更早开始训练
+    """
     config = TrainingConfig()
     config.num_channels = 64
     config.num_res_blocks = 3
-    config.num_simulations = 50
-    config.num_games_per_iter = 5
+    config.num_simulations = 80       # 增加到80次（原50次太少）
+    config.num_games_per_iter = 6
     config.num_iterations = 10
     config.batch_size = 64
-    config.num_epochs = 3
-    config.min_buffer_size = 200
+    config.num_epochs = 5             # 增加到5个epoch
+    config.min_buffer_size = 100      # 降低门槛，更早开始训练
     config.eval_games = 4
-    config.eval_simulations = 30
+    config.eval_simulations = 40
     config.save_interval = 2
-    config.temperature_threshold = 10
-    config.max_game_length = 100
+    config.temperature_threshold = 15
+    config.max_game_length = 200      # 增加到200步（关键改进）
+    config.learning_rate = 0.002      # 稍高学习率加速早期学习
+    config.random_opening_moves = 4   # 随机开局增加多样性
+    config.enable_resign = True       # 启用认输
+    config.resign_threshold = -0.85
+    config.resign_check_steps = 3
+    return config
+
+
+def standard_train():
+    """标准训练模式"""
+    config = TrainingConfig()
+    config.num_channels = 128
+    config.num_res_blocks = 6
+    config.num_simulations = 200
+    config.num_games_per_iter = 20
+    config.num_iterations = 50
+    config.max_game_length = 300
+    config.random_opening_moves = 6
+    config.enable_resign = True
+    return config
+
+
+def full_train():
+    """完整训练模式"""
+    config = TrainingConfig()
+    config.num_channels = 256
+    config.num_res_blocks = 10
+    config.num_simulations = 400
+    config.num_games_per_iter = 50
+    config.num_iterations = 200
+    config.max_game_length = 400
+    config.random_opening_moves = 8
+    config.enable_resign = True
     return config
 
 
@@ -601,19 +704,9 @@ def main():
     if args.mode == 'quick':
         config = quick_train()
     elif args.mode == 'standard':
-        config = TrainingConfig()
-        config.num_channels = 128
-        config.num_res_blocks = 6
-        config.num_simulations = 200
-        config.num_games_per_iter = 20
-        config.num_iterations = 50
+        config = standard_train()
     else:  # full
-        config = TrainingConfig()
-        config.num_channels = 256
-        config.num_res_blocks = 10
-        config.num_simulations = 400
-        config.num_games_per_iter = 50
-        config.num_iterations = 200
+        config = full_train()
 
     # 覆盖命令行参数
     if args.iterations:
