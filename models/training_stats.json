@@ -1,48 +1,25 @@
 [
   {
     "iteration": 1,
-    "time": 64.31417679786682,
+    "time": 47.4016752243042,
     "self_play": {
-      "games": 3,
-      "red_wins": 0,
-      "black_wins": 0,
-      "draws": 3,
+      "games": 4,
+      "red_wins": 2,
+      "black_wins": 1,
+      "draws": 1,
       "avg_steps": 60.0,
-      "buffer_size": 360,
-      "new_samples": 360
+      "new_samples": 466,
+      "total_time": 34.552000284194946,
+      "num_workers": 4,
+      "mode": "gpu",
+      "buffer_size": 466
     },
     "training": {
-      "policy_loss": 6.2122690081596375,
-      "value_loss": 0.00942692817382825,
-      "total_loss": 6.221695936333465,
-      "learning_rate": 0.001
+      "policy_loss": 4.504400390386581,
+      "value_loss": 0.1396520307753235,
+      "total_loss": 4.644052421161905,
+      "learning_rate": 0.002
     },
     "evaluation": {}
-  },
-  {
-    "iteration": 2,
-    "time": 90.08032965660095,
-    "self_play": {
-      "games": 3,
-      "red_wins": 0,
-      "black_wins": 0,
-      "draws": 3,
-      "avg_steps": 60.0,
-      "buffer_size": 720,
-      "new_samples": 360
-    },
-    "training": {
-      "policy_loss": 4.439172024312227,
-      "value_loss": 0.001889023323715462,
-      "total_loss": 4.441061047635942,
-      "learning_rate": 0.001
-    },
-    "evaluation": {
-      "new_wins": 0,
-      "old_wins": 0,
-      "draws": 2,
-      "win_rate": 0.5,
-      "model_updated": false
-    }
   }
 ]

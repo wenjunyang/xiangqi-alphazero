@@ -103,6 +103,10 @@ class TrainingConfig:
         self.checkpoint_dir = '../models'
         self.save_interval = 5        # 每N轮保存一次
 
+        # GPU 集中推理
+        self.use_gpu_server = False    # 是否使用 GPU 集中推理服务
+        self.gpu_device = 'cuda'       # GPU 推理设备
+
         # 设备
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -218,6 +222,7 @@ class AlphaZeroTrainer:
         logger.info(f"模型参数量: {count_parameters(self.current_model):,}")
         logger.info(f"CPU 核心数: {cpu_count}, 并行 workers: {self.num_workers}")
         logger.info(f"并行模式: {'启用' if config.parallel else '禁用'}")
+        logger.info(f"GPU推理服务: {'启用(' + config.gpu_device + ')' if config.use_gpu_server else '禁用'}")
 
     def self_play_game(self) -> Tuple[List, int, int]:
         """
@@ -306,11 +311,13 @@ class AlphaZeroTrainer:
             return self._serial_self_play()
 
     def _parallel_self_play(self) -> dict:
-        """并行自对弈"""
+        """并行自对弈（支持 CPU 本地推理和 GPU 集中推理两种模式）"""
         all_data, stats = parallel_self_play(
             model=self.best_model,
             config=self.config,
             num_workers=self.num_workers,
+            use_gpu_server=self.config.use_gpu_server,
+            gpu_device=self.config.gpu_device,
         )
 
         self.replay_buffer.extend(all_data)
@@ -711,6 +718,8 @@ def main():
     parser.add_argument('--device', type=str, default=None, help='计算设备 (cpu/cuda)')
     parser.add_argument('--workers', type=int, default=None, help='并行 worker 数量')
     parser.add_argument('--no-parallel', action='store_true', help='禁用并行自对弈')
+    parser.add_argument('--gpu-server', action='store_true', help='启用 GPU 集中推理服务')
+    parser.add_argument('--gpu-device', type=str, default=None, help='GPU 推理设备 (如 cuda:0)')
 
     args = parser.parse_args()
 
@@ -739,6 +748,10 @@ def main():
         config.num_workers = args.workers
     if args.no_parallel:
         config.parallel = False
+    if args.gpu_server:
+        config.use_gpu_server = True
+    if args.gpu_device:
+        config.gpu_device = args.gpu_device
 
     # 创建训练器
     trainer = AlphaZeroTrainer(config)

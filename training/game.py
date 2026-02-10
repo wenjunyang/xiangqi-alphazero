@@ -1,14 +1,13 @@
-"""
-中国象棋游戏引擎 (v3 性能优化版)
+"""中国象棋游戏引擎 (v4 Cython 加速版)
 ================================
 实现棋盘表示、走法生成、规则判定等核心逻辑。
 
-v3 优化内容：
-1. _is_in_check: 从将的位置反向检测攻击，O(固定方向数) 替代 O(棋子数×走法数)
-2. _kings_facing: NumPy 切片替代 Python 循环
-3. get_legal_moves: 走法合法性检查使用快速将军检测
+v4 优化内容：
+1. Cython C 扩展加速走法生成（~100x）、将军检测（~27x）
+2. 自动检测 Cython 引擎，不可用时回退到 Python 实现
+3. _is_in_check: 从将的位置反向检测攻击
 4. is_game_over: 缓存走法结果，避免重复计算
-5. get_state_for_nn / get_material_score: NumPy 向量化替代双重循环
+5. get_state_for_nn / get_material_score: NumPy 向量化环
 
 棋盘表示：
 - 10行 x 9列的二维数组
@@ -22,6 +21,30 @@ v3 优化内容：
 
 import numpy as np
 from typing import List, Tuple, Optional
+import os
+import sys
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 尝试导入 Cython 加速引擎
+_USE_CYTHON = False
+try:
+    _cython_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cython_engine')
+    if _cython_dir not in sys.path:
+        sys.path.insert(0, _cython_dir)
+    from game_core import (
+        cy_generate_legal_moves,
+        cy_is_in_check,
+        cy_find_king,
+        cy_is_attacked,
+        cy_has_legal_moves,
+    )
+    _USE_CYTHON = True
+    logger.info("Cython 加速引擎已加载 (~100x 加速)")
+except ImportError:
+    logger.warning("Cython 引擎未编译，使用 Python 回退版本。"
+                   "编译方法: cd training/cython_engine && python setup.py build_ext --inplace")
 
 # 棋子编码
 EMPTY = 0
@@ -470,24 +493,29 @@ class XiangqiGame:
         """
         获取当前玩家的所有合法走法。
         使用缓存避免重复计算。
+        自动使用 Cython 加速版本（如果可用）。
         """
         if self._legal_moves_cache is not None:
             return self._legal_moves_cache
 
-        moves = []
-        player = self.current_player
-        board = self.board
-
-        for r in range(ROWS):
-            for c in range(COLS):
-                p = board[r, c]
-                if p == EMPTY:
-                    continue
-                if (player == 1 and p > 0) or (player == -1 and p < 0):
-                    targets = self._generate_piece_moves(r, c, player)
-                    for tr, tc in targets:
-                        if self._is_move_legal(r, c, tr, tc, player):
-                            moves.append((r, c, tr, tc))
+        if _USE_CYTHON:
+            # Cython 加速版本 (~100x)
+            moves = cy_generate_legal_moves(self.board, self.current_player)
+        else:
+            # Python 回退版本
+            moves = []
+            player = self.current_player
+            board = self.board
+            for r in range(ROWS):
+                for c in range(COLS):
+                    p = board[r, c]
+                    if p == EMPTY:
+                        continue
+                    if (player == 1 and p > 0) or (player == -1 and p < 0):
+                        targets = self._generate_piece_moves(r, c, player)
+                        for tr, tc in targets:
+                            if self._is_move_legal(r, c, tr, tc, player):
+                                moves.append((r, c, tr, tc))
 
         self._legal_moves_cache = moves
         return moves
@@ -540,9 +568,13 @@ class XiangqiGame:
         使用缓存的走法结果，避免重复计算 get_legal_moves。
         返回: (是否结束, 赢家) 赢家: 1=红方, -1=黑方, 0=和棋, None=未结束
         """
-        # 检查将/帅是否存在（只搜索宫格范围）
-        r_king = self._find_king_pos(1, self.board)
-        b_king = self._find_king_pos(-1, self.board)
+        # 检查将/帅是否存在
+        if _USE_CYTHON:
+            r_king = cy_find_king(self.board, 1)
+            b_king = cy_find_king(self.board, -1)
+        else:
+            r_king = self._find_king_pos(1, self.board)
+            b_king = self._find_king_pos(-1, self.board)
 
         if r_king is None:
             return True, -1
@@ -608,7 +640,9 @@ class XiangqiGame:
         return features
 
     def _find_king(self, player: int) -> Optional[Tuple[int, int]]:
-        """找到指定方的将/帅位置（兼容旧接口）"""
+        """找到指定方的将/帅位置"""
+        if _USE_CYTHON:
+            return cy_find_king(self.board, player)
         return self._find_king_pos(player, self.board)
 
     def _kings_facing(self, board: np.ndarray) -> bool:
@@ -616,9 +650,11 @@ class XiangqiGame:
         return self._kings_facing_fast(board)
 
     def _is_in_check(self, player: int, board: Optional[np.ndarray] = None) -> bool:
-        """检查指定方是否被将军（兼容旧接口）"""
+        """检查指定方是否被将军"""
         if board is None:
             board = self.board
+        if _USE_CYTHON:
+            return cy_is_in_check(board, player)
         king_pos = self._find_king_pos(player, board)
         if king_pos is None:
             return True

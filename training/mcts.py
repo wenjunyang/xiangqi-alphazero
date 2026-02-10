@@ -5,6 +5,11 @@
 每次搜索执行 num_simulations 次模拟，逐次选择→扩展→评估→回溯。
 
 UCB公式: Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
+
+支持两种推理后端:
+- model: XiangqiNet 实例（本地 CPU/GPU 推理）
+- model: InferenceClient 实例（GPU 集中推理服务）
+两者都提供 .predict(state) 接口，透明切换。
 """
 
 import numpy as np
@@ -100,7 +105,7 @@ class MCTS:
 
         # 根节点：获取策略先验
         state = game.get_state_for_nn()
-        policy_probs, _ = self.model.predict(state, self.device)
+        policy_probs, _ = self._predict(state)
 
         legal_actions = game.get_legal_actions()
         if len(legal_actions) == 0:
@@ -133,7 +138,7 @@ class MCTS:
                 value = 0.0 if winner == 0 else -1.0
             else:
                 state = sim_game.get_state_for_nn()
-                policy_probs, value = self.model.predict(state, self.device)
+                policy_probs, value = self._predict(state)
 
                 legal_actions = sim_game.get_legal_actions()
                 if len(legal_actions) > 0:
@@ -146,6 +151,15 @@ class MCTS:
             node.backup(value)
 
         return self._get_action_probs(root, temperature)
+
+    def _predict(self, state):
+        """统一的推理接口，兼容 XiangqiNet 和 InferenceClient"""
+        try:
+            # InferenceClient: predict(state) -> (policy, value)
+            return self.model.predict(state, self.device)
+        except TypeError:
+            # InferenceClient 的 predict 只接受 state 参数
+            return self.model.predict(state)
 
     def get_action(self, game: XiangqiGame, temperature: float = 0.0,
                    add_noise: bool = False) -> int:
