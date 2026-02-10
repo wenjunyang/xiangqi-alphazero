@@ -67,7 +67,9 @@ def _server_main(
         for i in range(torch.cuda.device_count()):
             print(f"[InferenceServer]   GPU {i}: {torch.cuda.get_device_name(i)}", flush=True)
             props = torch.cuda.get_device_properties(i)
-            print(f"[InferenceServer]   显存: {props.total_mem / 1024**3:.1f} GB", flush=True)
+            # 兼容不同 PyTorch 版本: total_memory (旧版) vs total_mem (新版)
+            total_mem = getattr(props, 'total_memory', None) or getattr(props, 'total_mem', 0)
+            print(f"[InferenceServer]   显存: {total_mem / 1024**3:.1f} GB", flush=True)
     
     # 确定实际使用的设备
     actual_device = device_str
