@@ -390,16 +390,13 @@ def _run_gpu_mode(model, config, num_workers, games_per_worker, remainder, num_g
         },
         state_dict={k: v.cpu().clone() for k, v in model.state_dict().items()},
         device=gpu_device,
+        num_workers=num_workers,
         max_batch_size=num_workers * 2,
         batch_timeout_ms=5.0,
     )
 
-    # 为每个 worker 创建响应队列
-    response_queues = {}
-    for w in range(num_workers):
-        response_queues[w] = server.create_worker_queue(w)
-
-    server.start()
+    # 启动服务并获取响应队列
+    response_queues = server.start()
 
     try:
         # 构建 worker 参数

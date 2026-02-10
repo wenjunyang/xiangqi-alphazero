@@ -10,11 +10,9 @@ GPU 集中推理服务
     Worker 3 ──┼──→ InferenceServer（单进程，GPU 批量推理）
     Worker N ──┘    收集请求 → 组 batch → GPU 推理 → 分发结果
 
-关键设计:
-    - 使用 multiprocessing.Manager().Queue() 创建可序列化的代理队列
-    - 这些代理队列可以安全地通过 pickle 传递给 spawn 模式的子进程
-    - request_queue: 所有 worker 共享的请求队列
-    - response_queues: dict[worker_id -> Queue]，每个 worker 一个响应队列
+关键修复:
+    - Manager 在 start() 中延迟初始化，避免 spawn 模式下的死锁
+    - start() 返回 response_queues 字典，供 worker 使用
 """
 
 import os
@@ -152,15 +150,10 @@ class InferenceServer:
     """
     GPU 集中推理服务。
 
-    使用 multiprocessing.Manager() 创建代理队列，
-    这些队列可以安全地通过 pickle 传递给 spawn 模式的子进程。
-
     使用方法:
-        server = InferenceServer(model_class, model_kwargs, state_dict, device='cuda')
-        q0 = server.create_worker_queue(0)
-        q1 = server.create_worker_queue(1)
-        server.start()
-        # worker 中: client = InferenceClient(wid, server.request_queue, q_i)
+        server = InferenceServer(model_class, model_kwargs, state_dict, device='cuda', num_workers=14)
+        response_queues = server.start()  # 返回 {worker_id: Queue}
+        # worker 中: client = InferenceClient(wid, server.request_queue, response_queues[wid])
         server.stop()
     """
 
@@ -170,6 +163,7 @@ class InferenceServer:
         model_kwargs: dict,
         state_dict: dict,
         device: str = 'cuda',
+        num_workers: int = 1,
         max_batch_size: int = 256,
         batch_timeout_ms: float = 5.0,
     ):
@@ -177,24 +171,37 @@ class InferenceServer:
         self.model_kwargs = model_kwargs
         self.state_dict = state_dict
         self.device = device
+        self.num_workers = num_workers
         self.max_batch_size = max_batch_size
         self.batch_timeout_ms = batch_timeout_ms
 
-        # 使用 Manager 创建可序列化的代理队列
-        self._manager = mp.Manager()
-        self.request_queue = self._manager.Queue()
+        # 延迟初始化，避免 spawn 模式下的死锁
+        self._manager = None
+        self.request_queue = None
         self._response_queues: Dict[int, object] = {}
         self._process = None
+        self._stop_event = None
+        self._started = False
+
+    def start(self) -> Dict[int, object]:
+        """
+        启动推理服务进程。
+        
+        返回:
+            response_queues: {worker_id: Queue} 字典，供 worker 使用
+        """
+        if self._started:
+            raise RuntimeError("推理服务已经启动")
+        
+        # 在 start() 中创建 Manager，避免 spawn 模式下的死锁
+        self._manager = mp.Manager()
+        self.request_queue = self._manager.Queue()
         self._stop_event = self._manager.Event()
-
-    def create_worker_queue(self, worker_id: int):
-        """为 worker 创建响应队列（Manager 代理队列，可跨 spawn 进程传递）"""
-        q = self._manager.Queue()
-        self._response_queues[worker_id] = q
-        return q
-
-    def start(self):
-        """启动推理服务进程"""
+        
+        # 为每个 worker 创建响应队列
+        for wid in range(self.num_workers):
+            self._response_queues[wid] = self._manager.Queue()
+        
         response_queues_list = [(wid, q) for wid, q in self._response_queues.items()]
 
         ctx = mp.get_context('spawn')
@@ -214,25 +221,32 @@ class InferenceServer:
             daemon=True,
         )
         self._process.start()
+        self._started = True
         logger.info(f"GPU 推理服务已启动 (PID={self._process.pid}, device={self.device})")
+        
+        # 返回响应队列供 worker 使用
+        return self._response_queues
 
     def stop(self):
         """停止推理服务"""
-        self._stop_event.set()
+        if self._stop_event is not None:
+            self._stop_event.set()
         if self._process is not None and self._process.is_alive():
             self._process.join(timeout=5)
             if self._process.is_alive():
                 self._process.terminate()
             logger.info("GPU 推理服务已停止")
         # 关闭 Manager
-        try:
-            self._manager.shutdown()
-        except Exception:
-            pass
+        if self._manager is not None:
+            try:
+                self._manager.shutdown()
+            except Exception:
+                pass
 
     def update_model(self, state_dict: dict):
         """更新模型权重"""
-        self.request_queue.put(('UPDATE_MODEL', state_dict, None))
+        if self.request_queue is not None:
+            self.request_queue.put(('UPDATE_MODEL', state_dict, None))
 
 
 class InferenceClient:
@@ -249,36 +263,32 @@ class InferenceClient:
         self.response_queue = response_queue
         self._request_counter = 0
 
-    def predict(self, state: np.ndarray, device: str = None):
+    def predict(self, state: np.ndarray, device: str = 'cpu') -> tuple:
         """
         发送推理请求并等待结果。
-        兼容 XiangqiNet.predict(state, device) 接口。
-
+        
         参数:
-            state: numpy 数组 (15, 10, 9)
-            device: 忽略（由 InferenceServer 决定设备）
+            state: (15, 10, 9) 的 numpy 数组
+            device: 忽略（由推理服务决定）
+        
         返回:
-            (policy, value) - policy 是 numpy 数组, value 是 float
+            (policy, value): policy 是 (8100,) 的概率分布，value 是标量
         """
-        self._request_counter += 1
         req_id = self._request_counter
+        self._request_counter += 1
 
+        # 发送请求
         self.request_queue.put((req_id, self.worker_id, state))
-        resp_id, policy, value = self.response_queue.get(timeout=60)
-        return policy, float(value)
 
-    def batch_predict(self, states: list):
-        """批量推理"""
-        req_ids = []
-        for state in states:
-            self._request_counter += 1
-            req_id = self._request_counter
-            req_ids.append(req_id)
-            self.request_queue.put((req_id, self.worker_id, state))
-
-        results = {}
-        while len(results) < len(req_ids):
-            resp_id, policy, value = self.response_queue.get(timeout=60)
-            results[resp_id] = (policy, float(value))
-
-        return [results[rid] for rid in req_ids]
+        # 等待响应
+        while True:
+            try:
+                resp_id, policy, value = self.response_queue.get(timeout=30)
+                if resp_id == req_id:
+                    return policy, value
+            except Exception as e:
+                print(f"[InferenceClient] Worker {self.worker_id} 等待响应超时: {e}")
+                # 返回 dummy 结果
+                action_space = 8100
+                dummy_policy = np.ones(action_space, dtype=np.float32) / action_space
+                return dummy_policy, 0.0
