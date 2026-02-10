@@ -11,10 +11,13 @@
     每个 worker → 重建模型(CPU) → 串行完成 K 局 → 返回数据
 
   模式2 (GPU):
-    主进程 → 启动 InferenceServer(GPU)
-    主进程 → 启动 N 个 worker 进程
-    每个 worker → InferenceClient → 发送推理请求 → 等待结果
+    主进程 → spawn 启动 InferenceServer(GPU)
+    主进程 → spawn 启动 N 个 worker 进程
+    每个 worker → InferenceClient → 通过 Unix socket 发送推理请求
     InferenceServer → 收集请求 → 组 batch → GPU 推理 → 分发结果
+
+    关键: 全部使用 spawn 模式启动，通过 Unix socket 通信
+    彻底避免 fork + PyTorch 死锁问题
 """
 
 import os
@@ -198,11 +201,15 @@ def _cpu_worker_entry(args: dict) -> List[Tuple[List, int, int]]:
 
 
 # ============================================================
-# 模式2: GPU 集中推理 Worker
+# 模式2: GPU 集中推理 Worker（spawn 模式启动）
 # ============================================================
 
 def _gpu_worker_entry(args: dict) -> List[Tuple[List, int, int]]:
-    """GPU 模式 Worker 进程入口：使用 InferenceClient 发送推理请求"""
+    """
+    GPU 模式 Worker 进程入口（使用 spawn + ProcessPoolExecutor 启动）。
+
+    通过 Unix socket 连接到 InferenceServer，无需传递 Queue 对象。
+    """
     os.environ['OMP_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     try:
@@ -217,10 +224,13 @@ def _gpu_worker_entry(args: dict) -> List[Tuple[List, int, int]]:
     try:
         from inference_server import InferenceClient
 
+        worker_id = args['worker_id']
+        socket_path = args['socket_path']
+
+        # 创建客户端（延迟连接）
         client = InferenceClient(
-            worker_id=args['worker_id'],
-            request_queue=args['request_queue'],
-            response_queue=args['response_queue'],
+            worker_id=worker_id,
+            socket_path=socket_path,
         )
 
         class WorkerConfig:
@@ -233,11 +243,12 @@ def _gpu_worker_entry(args: dict) -> List[Tuple[List, int, int]]:
             setattr(cfg, key, args[key])
 
         results = []
-        for _ in range(args['num_games']):
+        for game_idx in range(args['num_games']):
             data, winner, steps = _play_one_game(client, cfg, 'cpu')
             aug_data = _augment_data(data)
             results.append((aug_data, winner, steps))
 
+        client.close()
         return results
 
     except Exception as e:
@@ -378,7 +389,15 @@ def _run_cpu_mode(model, config, num_workers, games_per_worker, remainder, num_g
 
 
 def _run_gpu_mode(model, config, num_workers, games_per_worker, remainder, num_games, gpu_device):
-    """GPU 集中推理模式"""
+    """
+    GPU 集中推理模式。
+
+    关键设计:
+    - InferenceServer 使用 spawn 启动，彻底避免 fork + PyTorch 死锁
+    - Worker 也使用 spawn (ProcessPoolExecutor) 启动
+    - 通过 Unix socket 通信，无需传递 Queue 对象
+    - socket_path 是字符串，可以安全地 pickle 传递给 spawn 的子进程
+    """
     from inference_server import InferenceServer
 
     # 启动推理服务
@@ -395,45 +414,45 @@ def _run_gpu_mode(model, config, num_workers, games_per_worker, remainder, num_g
         batch_timeout_ms=5.0,
     )
 
-    # 启动服务并获取响应队列
-    response_queues = server.start()
+    # 启动服务并获取 socket 路径（阻塞直到服务就绪）
+    socket_path = server.start()
+
+    # 构建 worker 参数
+    worker_args_list = []
+    for w in range(num_workers):
+        this_games = games_per_worker + (1 if w < remainder else 0)
+        if this_games <= 0:
+            continue
+        worker_args_list.append({
+            'worker_id': w,
+            'socket_path': socket_path,
+            'num_games': this_games,
+            'num_simulations': config.num_simulations,
+            'c_puct': config.c_puct,
+            'temperature_threshold': config.temperature_threshold,
+            'max_game_length': config.max_game_length,
+            'random_opening_moves': config.random_opening_moves,
+            'enable_resign': config.enable_resign,
+            'resign_threshold': config.resign_threshold,
+            'resign_check_steps': config.resign_check_steps,
+        })
+
+    all_data = []
+    win_counts = {1: 0, -1: 0, 0: 0}
+    total_steps = 0
+    valid_games = 0
 
     try:
-        # 构建 worker 参数
-        worker_args_list = []
-        for w in range(num_workers):
-            this_games = games_per_worker + (1 if w < remainder else 0)
-            if this_games <= 0:
-                continue
-            worker_args_list.append({
-                'worker_id': w,
-                'request_queue': server.request_queue,
-                'response_queue': response_queues[w],
-                'num_games': this_games,
-                'num_simulations': config.num_simulations,
-                'c_puct': config.c_puct,
-                'temperature_threshold': config.temperature_threshold,
-                'max_game_length': config.max_game_length,
-                'random_opening_moves': config.random_opening_moves,
-                'enable_resign': config.enable_resign,
-                'resign_threshold': config.resign_threshold,
-                'resign_check_steps': config.resign_check_steps,
-            })
-
-        all_data = []
-        win_counts = {1: 0, -1: 0, 0: 0}
-        total_steps = 0
-        valid_games = 0
-
+        # 使用 spawn 模式的 ProcessPoolExecutor
         ctx = mp.get_context('spawn')
         with ProcessPoolExecutor(max_workers=len(worker_args_list), mp_context=ctx) as executor:
             futures = {
-                executor.submit(_gpu_worker_entry, args): i
-                for i, args in enumerate(worker_args_list)
+                executor.submit(_gpu_worker_entry, args): args['worker_id']
+                for args in worker_args_list
             }
 
             for future in as_completed(futures):
-                worker_idx = futures[future]
+                worker_id = futures[future]
                 try:
                     worker_results = future.result()
                     for aug_data, winner, steps in worker_results:
@@ -445,7 +464,9 @@ def _run_gpu_mode(model, config, num_workers, games_per_worker, remainder, num_g
                             winner_str = '红' if winner == 1 else '黑' if winner == -1 else '和'
                             logger.info(f"  对局 {valid_games}/{num_games}: 步数={steps}, 赢家={winner_str}")
                 except Exception as e:
-                    logger.error(f"  Worker {worker_idx} 异常: {e}")
+                    logger.error(f"  Worker {worker_id} 异常: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     finally:
         server.stop()
