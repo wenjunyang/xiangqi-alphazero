@@ -135,7 +135,9 @@ class MCTS:
             # 评估叶节点
             done, winner = sim_game.is_game_over()
             if done:
-                value = 0.0 if winner == 0 else -1.0
+                # 注意：node 对应的是“走棋前的状态”，sim_game 是“走棋后的状态”
+                # 如果游戏结束，说明刚走完棋的玩家赢了，从 node 视角看 value = +1.0
+                value = 0.0 if winner == 0 else 1.0
             else:
                 state = sim_game.get_state_for_nn()
                 policy_probs, value = self._predict(state)
