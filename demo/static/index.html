@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>中国象棋AI演示</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  min-height: 100vh;
+}
+
+/* 顶部标题 */
+.header {
+  background: linear-gradient(135deg, #16213e, #0f3460);
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #2a2a4a;
+}
+.header h1 {
+  font-size: 20px;
+  color: #e94560;
+  font-weight: 700;
+}
+.header .subtitle {
+  font-size: 12px;
+  color: #888;
+  margin-top: 2px;
+}
+.header .status {
+  font-size: 13px;
+  color: #aaa;
+}
+.status .dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: #555;
+}
+.status .dot.loaded { background: #4caf50; }
+.status .dot.thinking { background: #ff9800; animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* 主布局 */
+.main {
+  display: flex;
+  gap: 20px;
+  padding: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
+  align-items: flex-start;
+}
+
+/* 左侧：棋盘 */
+.board-section {
+  flex-shrink: 0;
+}
+#board-canvas {
+  cursor: pointer;
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.turn-info {
+  text-align: center;
+  margin-top: 10px;
+  font-size: 15px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #16213e;
+}
+.turn-info .red { color: #e94560; font-weight: 600; }
+.turn-info .black { color: #ccc; font-weight: 600; }
+.turn-info .thinking { color: #ff9800; }
+.game-result {
+  text-align: center;
+  margin-top: 8px;
+  font-size: 18px;
+  font-weight: 700;
+  padding: 10px;
+  border-radius: 6px;
+  display: none;
+}
+.game-result.show { display: block; }
+.game-result.red-win { background: #e94560; color: #fff; }
+.game-result.black-win { background: #333; color: #fff; }
+.game-result.draw { background: #666; color: #fff; }
+
+/* 右侧面板 */
+.panel-section {
+  flex: 1;
+  min-width: 320px;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.card {
+  background: #16213e;
+  border: 1px solid #2a2a4a;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.card-header {
+  padding: 12px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #e94560;
+  border-bottom: 1px solid #2a2a4a;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card-body {
+  padding: 16px;
+}
+
+/* 控制面板 */
+.control-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+  align-items: center;
+}
+.control-row label {
+  font-size: 13px;
+  color: #aaa;
+  min-width: 80px;
+  flex-shrink: 0;
+}
+.control-row select,
+.control-row input[type="number"] {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #2a2a4a;
+  background: #0f3460;
+  color: #e0e0e0;
+  font-size: 13px;
+  outline: none;
+}
+.control-row select:focus,
+.control-row input:focus {
+  border-color: #e94560;
+}
+
+.btn-group {
+  display: flex;
+  gap: 8px;
+}
+.btn {
+  flex: 1;
+  padding: 10px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: #e94560;
+  color: #fff;
+}
+.btn-primary:hover:not(:disabled) { background: #d63851; }
+.btn-secondary {
+  background: #2a2a4a;
+  color: #ccc;
+}
+.btn-secondary:hover:not(:disabled) { background: #3a3a5a; }
+
+.side-select {
+  display: flex;
+  gap: 6px;
+}
+.side-btn {
+  flex: 1;
+  padding: 8px;
+  border: 2px solid #2a2a4a;
+  border-radius: 6px;
+  background: transparent;
+  color: #aaa;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.side-btn.active-red {
+  border-color: #e94560;
+  color: #e94560;
+  background: rgba(233,69,96,0.1);
+}
+.side-btn.active-black {
+  border-color: #888;
+  color: #fff;
+  background: rgba(255,255,255,0.1);
+}
+
+/* AI分析面板 */
+.value-bar-container {
+  margin-bottom: 16px;
+}
+.value-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 4px;
+}
+.value-bar {
+  height: 28px;
+  background: #333;
+  border-radius: 14px;
+  overflow: hidden;
+  position: relative;
+}
+.value-bar-fill {
+  height: 100%;
+  transition: width 0.5s ease;
+  border-radius: 14px;
+}
+.value-bar-fill.positive {
+  background: linear-gradient(90deg, #e94560, #ff6b6b);
+}
+.value-bar-fill.negative {
+  background: linear-gradient(90deg, #555, #888);
+}
+.value-score {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+}
+
+.move-list {
+  list-style: none;
+}
+.move-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border-radius: 6px;
+  font-size: 13px;
+  transition: background 0.2s;
+}
+.move-item:hover {
+  background: rgba(255,255,255,0.05);
+}
+.move-item.selected {
+  background: rgba(233,69,96,0.15);
+  border-left: 3px solid #e94560;
+}
+.move-item.illegal {
+  opacity: 0.4;
+}
+.move-rank {
+  width: 22px;
+  font-size: 11px;
+  color: #666;
+  flex-shrink: 0;
+}
+.move-label {
+  flex: 1;
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+}
+.move-prob {
+  width: 50px;
+  text-align: right;
+  font-weight: 600;
+  font-size: 13px;
+  margin-right: 8px;
+}
+.move-bar {
+  width: 80px;
+  height: 6px;
+  background: #2a2a4a;
+  border-radius: 3px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.move-bar-fill {
+  height: 100%;
+  background: #e94560;
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+.move-tag {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-left: 6px;
+  flex-shrink: 0;
+}
+.move-tag.selected-tag { background: #e94560; color: #fff; }
+.move-tag.legal-tag { background: #2a5a2a; color: #6f6; }
+.move-tag.illegal-tag { background: #5a2a2a; color: #f66; }
+
+/* 走棋历史 */
+.history-list {
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 12px;
+  font-family: 'Courier New', monospace;
+}
+.history-item {
+  padding: 3px 8px;
+  border-bottom: 1px solid #1a1a2e;
+}
+.history-item:nth-child(odd) { background: rgba(255,255,255,0.02); }
+
+/* 无模型提示 */
+.no-model-hint {
+  text-align: center;
+  padding: 20px;
+  color: #888;
+  font-size: 13px;
+}
+.no-model-hint .icon { font-size: 40px; margin-bottom: 10px; }
+
+/* 加载中 */
+.loading-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  display: none;
+}
+.loading-overlay.show { display: flex; }
+.loading-spinner {
+  background: #16213e;
+  padding: 30px 40px;
+  border-radius: 12px;
+  text-align: center;
+}
+.loading-spinner .spinner {
+  width: 40px; height: 40px;
+  border: 4px solid #2a2a4a;
+  border-top-color: #e94560;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 12px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>中国象棋AI</h1>
+    <div class="subtitle">AlphaZero 强化学习 · MCTS 搜索</div>
+  </div>
+  <div class="status" id="status">
+    <span class="dot" id="status-dot"></span>
+    <span id="status-text">未加载模型</span>
+  </div>
+</div>
+
+<div class="main">
+  <!-- 左侧：棋盘 -->
+  <div class="board-section">
+    <canvas id="board-canvas" width="540" height="600"></canvas>
+    <div class="turn-info" id="turn-info">请先加载模型并开始新游戏</div>
+    <div class="game-result" id="game-result"></div>
+  </div>
+
+  <!-- 右侧面板 -->
+  <div class="panel-section">
+    <!-- 控制面板 -->
+    <div class="card">
+      <div class="card-header">⚙ 对局设置</div>
+      <div class="card-body">
+        <div class="control-row">
+          <label>AI模型</label>
+          <select id="model-select"><option value="">加载中...</option></select>
+        </div>
+        <div class="control-row">
+          <label>MCTS次数</label>
+          <input type="number" id="simulations" value="500" min="10" max="10000" step="10">
+        </div>
+        <div class="control-row">
+          <label>执子方</label>
+          <div class="side-select">
+            <button class="side-btn active-red" id="side-red" onclick="selectSide('red')">执红先行</button>
+            <button class="side-btn" id="side-black" onclick="selectSide('black')">执黑后行</button>
+          </div>
+        </div>
+        <div class="btn-group" style="margin-top: 4px;">
+          <button class="btn btn-primary" id="btn-new-game" onclick="newGame()">新局</button>
+          <button class="btn btn-secondary" id="btn-load-model" onclick="loadModel()">加载模型</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI分析面板 -->
+    <div class="card">
+      <div class="card-header">🧠 AI分析</div>
+      <div class="card-body" id="analysis-panel">
+        <div class="no-model-hint" id="no-analysis">
+          <div class="icon">🎯</div>
+          AI走棋后将显示分析结果
+        </div>
+        <div id="analysis-content" style="display:none;">
+          <div class="value-bar-container">
+            <div class="value-label">
+              <span>黑方优势</span>
+              <span>红方优势</span>
+            </div>
+            <div class="value-bar">
+              <div class="value-bar-fill positive" id="value-bar-fill"></div>
+              <div class="value-score" id="value-score-text">0.000</div>
+            </div>
+          </div>
+          <div style="font-size:12px; color:#888; margin-bottom:8px;">
+            Top走法 (MCTS搜索概率)
+          </div>
+          <ul class="move-list" id="move-list"></ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- 走棋历史 -->
+    <div class="card">
+      <div class="card-header">📜 走棋记录</div>
+      <div class="card-body">
+        <div class="history-list" id="history-list">
+          <div style="color:#666; font-size:13px; text-align:center; padding:10px;">暂无记录</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 加载遮罩 -->
+<div class="loading-overlay" id="loading">
+  <div class="loading-spinner">
+    <div class="spinner"></div>
+    <div id="loading-text">加载中...</div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// 常量
+// ============================================================
+const ROWS = 10, COLS = 9;
+const CELL_SIZE = 60;
+const PADDING = 30;
+const BOARD_W = CELL_SIZE * (COLS - 1) + PADDING * 2;
+const BOARD_H = CELL_SIZE * (ROWS - 1) + PADDING * 2;
+
+const PIECE_CHARS = {
+  1: '帅', 2: '仕', 3: '相', 4: '馬', 5: '車', 6: '炮', 7: '兵',
+  '-1': '将', '-2': '士', '-3': '象', '-4': '馬', '-5': '車', '-6': '炮', '-7': '卒'
+};
+
+// ============================================================
+// 状态
+// ============================================================
+let board = null;
+let currentPlayer = 1;
+let humanSide = 1;
+let selectedPiece = null;
+let validMoves = [];
+let lastAiMove = null;
+let lastHumanMove = null;
+let gameOver = false;
+let isThinking = false;
+let moveHistory = [];
+let flipped = true; // 是否翻转棋盘（执红时翻转，让红方在下方）
+
+const canvas = document.getElementById('board-canvas');
+const ctx = canvas.getContext('2d');
+canvas.width = BOARD_W;
+canvas.height = BOARD_H;
+
+// ============================================================
+// 绘制棋盘
+// ============================================================
+function drawBoard() {
+  const W = BOARD_W, H = BOARD_H;
+  const P = PADDING, S = CELL_SIZE;
+
+  // 背景
+  ctx.fillStyle = '#d4a76a';
+  ctx.fillRect(0, 0, W, H);
+
+  // 木纹效果
+  ctx.fillStyle = 'rgba(139, 90, 43, 0.08)';
+  for (let i = 0; i < H; i += 3) {
+    ctx.fillRect(0, i, W, 1);
+  }
+
+  ctx.strokeStyle = '#5a3a1a';
+  ctx.lineWidth = 1;
+
+  // 横线
+  for (let r = 0; r < ROWS; r++) {
+    ctx.beginPath();
+    ctx.moveTo(P, P + r * S);
+    ctx.lineTo(P + 8 * S, P + r * S);
+    ctx.stroke();
+  }
+
+  // 竖线
+  for (let c = 0; c < COLS; c++) {
+    // 上半部分
+    ctx.beginPath();
+    ctx.moveTo(P + c * S, P);
+    ctx.lineTo(P + c * S, P + 4 * S);
+    ctx.stroke();
+    // 下半部分
+    ctx.beginPath();
+    ctx.moveTo(P + c * S, P + 5 * S);
+    ctx.lineTo(P + c * S, P + 9 * S);
+    ctx.stroke();
+  }
+  // 左右边线贯穿
+  ctx.beginPath();
+  ctx.moveTo(P, P); ctx.lineTo(P, P + 9 * S);
+  ctx.moveTo(P + 8 * S, P); ctx.lineTo(P + 8 * S, P + 9 * S);
+  ctx.stroke();
+
+  // 九宫格斜线
+  ctx.beginPath();
+  // 上方九宫（黑方）
+  let topPalaceRow = flipped ? 0 : 7;
+  let botPalaceRow = flipped ? 7 : 0;
+  ctx.moveTo(P + 3 * S, P + topPalaceRow * S);
+  ctx.lineTo(P + 5 * S, P + (topPalaceRow + 2) * S);
+  ctx.moveTo(P + 5 * S, P + topPalaceRow * S);
+  ctx.lineTo(P + 3 * S, P + (topPalaceRow + 2) * S);
+  // 下方九宫（红方）
+  ctx.moveTo(P + 3 * S, P + botPalaceRow * S);
+  ctx.lineTo(P + 5 * S, P + (botPalaceRow + 2) * S);
+  ctx.moveTo(P + 5 * S, P + botPalaceRow * S);
+  ctx.lineTo(P + 3 * S, P + (botPalaceRow + 2) * S);
+  ctx.stroke();
+
+  // 楚河汉界
+  ctx.fillStyle = '#5a3a1a';
+  ctx.font = 'bold 22px serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const riverY = P + 4.5 * S;
+  if (flipped) {
+    ctx.fillText('漢　界', P + 2 * S, riverY);
+    ctx.fillText('楚　河', P + 6 * S, riverY);
+  } else {
+    ctx.fillText('楚　河', P + 2 * S, riverY);
+    ctx.fillText('漢　界', P + 6 * S, riverY);
+  }
+
+  // 外边框
+  ctx.strokeStyle = '#5a3a1a';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(P - 8, P - 8, 8 * S + 16, 9 * S + 16);
+}
+
+function boardToScreen(row, col) {
+  const displayRow = flipped ? (9 - row) : row;
+  const displayCol = flipped ? (8 - col) : col;
+  return {
+    x: PADDING + displayCol * CELL_SIZE,
+    y: PADDING + displayRow * CELL_SIZE,
+  };
+}
+
+function screenToBoard(sx, sy) {
+  let displayCol = Math.round((sx - PADDING) / CELL_SIZE);
+  let displayRow = Math.round((sy - PADDING) / CELL_SIZE);
+  if (displayRow < 0 || displayRow > 9 || displayCol < 0 || displayCol > 8) return null;
+  const row = flipped ? (9 - displayRow) : displayRow;
+  const col = flipped ? (8 - displayCol) : displayCol;
+  return { row, col };
+}
+
+function drawPiece(row, col, piece) {
+  if (piece === 0) return;
+  const { x, y } = boardToScreen(row, col);
+  const r = 26;
+
+  // 棋子底色
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  const isRed = piece > 0;
+  ctx.fillStyle = isRed ? '#f5e6d0' : '#f5e6d0';
+  ctx.fill();
+  ctx.strokeStyle = isRed ? '#8b0000' : '#1a1a1a';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // 内圈
+  ctx.beginPath();
+  ctx.arc(x, y, r - 4, 0, Math.PI * 2);
+  ctx.strokeStyle = isRed ? '#c0392b' : '#555';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // 文字
+  ctx.fillStyle = isRed ? '#c0392b' : '#1a1a1a';
+  ctx.font = 'bold 22px "KaiTi", "STKaiti", "SimSun", serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(PIECE_CHARS[piece] || '?', x, y + 1);
+}
+
+function drawHighlight(row, col, color, type) {
+  const { x, y } = boardToScreen(row, col);
+  if (type === 'selected') {
+    ctx.beginPath();
+    ctx.arc(x, y, 28, 0, Math.PI * 2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  } else if (type === 'valid') {
+    ctx.beginPath();
+    ctx.arc(x, y, 10, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  } else if (type === 'last-move') {
+    ctx.beginPath();
+    ctx.arc(x, y, 28, 0, Math.PI * 2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function render() {
+  drawBoard();
+  if (!board) return;
+
+  // 绘制上一步走法高亮
+  if (lastAiMove) {
+    drawHighlight(lastAiMove.from[0], lastAiMove.from[1], 'rgba(255,152,0,0.5)', 'last-move');
+    drawHighlight(lastAiMove.to[0], lastAiMove.to[1], 'rgba(255,152,0,0.5)', 'last-move');
+  }
+  if (lastHumanMove) {
+    drawHighlight(lastHumanMove.from[0], lastHumanMove.from[1], 'rgba(76,175,80,0.4)', 'last-move');
+    drawHighlight(lastHumanMove.to[0], lastHumanMove.to[1], 'rgba(76,175,80,0.4)', 'last-move');
+  }
+
+  // 绘制选中棋子和合法走法
+  if (selectedPiece) {
+    drawHighlight(selectedPiece.row, selectedPiece.col, '#4caf50', 'selected');
+    for (const [tr, tc] of validMoves) {
+      const target = board[tr][tc];
+      if (target !== 0) {
+        drawHighlight(tr, tc, 'rgba(244,67,54,0.6)', 'selected');
+      } else {
+        drawHighlight(tr, tc, 'rgba(76,175,80,0.5)', 'valid');
+      }
+    }
+  }
+
+  // 绘制棋子
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      drawPiece(r, c, board[r][c]);
+    }
+  }
+}
+
+// ============================================================
+// 交互逻辑
+// ============================================================
+canvas.addEventListener('click', async (e) => {
+  if (!board || gameOver || isThinking) return;
+  if (currentPlayer !== humanSide) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const sy = (e.clientY - rect.top) * (canvas.height / rect.height);
+  const pos = screenToBoard(sx, sy);
+  if (!pos) return;
+
+  const { row, col } = pos;
+  const piece = board[row][col];
+
+  // 如果点击了自己的棋子 → 选中
+  if ((humanSide === 1 && piece > 0) || (humanSide === -1 && piece < 0)) {
+    selectedPiece = { row, col };
+    // 请求合法走法
+    const resp = await fetch('/api/get_legal_moves', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ row, col }),
+    });
+    const data = await resp.json();
+    validMoves = data.moves || [];
+    render();
+    return;
+  }
+
+  // 如果已选中棋子且点击了合法目标 → 走棋
+  if (selectedPiece) {
+    const isValid = validMoves.some(([tr, tc]) => tr === row && tc === col);
+    if (isValid) {
+      await doHumanMove(selectedPiece.row, selectedPiece.col, row, col);
+    } else {
+      // 取消选择
+      selectedPiece = null;
+      validMoves = [];
+      render();
+    }
+  }
+});
+
+async function doHumanMove(fr, fc, tr, tc) {
+  selectedPiece = null;
+  validMoves = [];
+  isThinking = true;
+  updateTurnInfo();
+
+  try {
+    const resp = await fetch('/api/human_move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_row: fr, from_col: fc, to_row: tr, to_col: tc }),
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      alert(data.error);
+      isThinking = false;
+      updateTurnInfo();
+      return;
+    }
+
+    // 记录人类走法
+    lastHumanMove = { from: [fr, fc], to: [tr, tc] };
+    addHistory(humanSide, `(${fr},${fc})→(${tr},${tc})`);
+
+    // 更新棋盘
+    board = data.board;
+    currentPlayer = data.current_player;
+    gameOver = data.game_over;
+
+    // AI走法
+    if (data.ai_move) {
+      lastAiMove = data.ai_move;
+      addHistory(-humanSide, data.ai_move.label || `(${data.ai_move.from[0]},${data.ai_move.from[1]})→(${data.ai_move.to[0]},${data.ai_move.to[1]})`);
+      currentPlayer = data.current_player;
+      gameOver = data.game_over;
+    }
+
+    // AI分析
+    if (data.ai_analysis) {
+      updateAnalysis(data.ai_analysis);
+    }
+
+    // 游戏结束
+    if (data.game_over) {
+      showGameResult(data.winner);
+    }
+  } catch (err) {
+    console.error(err);
+    alert('请求失败: ' + err.message);
+  }
+
+  isThinking = false;
+  render();
+  updateTurnInfo();
+}
+
+// ============================================================
+// UI更新
+// ============================================================
+function updateTurnInfo() {
+  const el = document.getElementById('turn-info');
+  if (!board) {
+    el.innerHTML = '请先加载模型并开始新游戏';
+    return;
+  }
+  if (gameOver) {
+    el.innerHTML = '游戏结束';
+    return;
+  }
+  if (isThinking) {
+    el.innerHTML = '<span class="thinking">🤔 AI思考中...</span>';
+    document.getElementById('status-dot').className = 'dot thinking';
+    document.getElementById('status-text').textContent = 'AI思考中...';
+    return;
+  }
+  if (currentPlayer === humanSide) {
+    const sideText = humanSide === 1 ? '<span class="red">红方</span>' : '<span class="black">黑方</span>';
+    el.innerHTML = `轮到你走棋 (${sideText})`;
+  } else {
+    el.innerHTML = '等待AI...';
+  }
+  document.getElementById('status-dot').className = 'dot loaded';
+  document.getElementById('status-text').textContent = '就绪';
+}
+
+function updateAnalysis(analysis) {
+  document.getElementById('no-analysis').style.display = 'none';
+  document.getElementById('analysis-content').style.display = 'block';
+
+  // Value bar
+  const v = analysis.value_score;
+  const pct = Math.max(5, Math.min(95, (v + 1) / 2 * 100));
+  const fill = document.getElementById('value-bar-fill');
+  fill.style.width = pct + '%';
+  fill.className = 'value-bar-fill ' + (v >= 0 ? 'positive' : 'negative');
+  document.getElementById('value-score-text').textContent = (v >= 0 ? '+' : '') + v.toFixed(3);
+
+  // Top moves
+  const list = document.getElementById('move-list');
+  list.innerHTML = '';
+  for (let i = 0; i < analysis.top_moves.length; i++) {
+    const m = analysis.top_moves[i];
+    const li = document.createElement('li');
+    li.className = 'move-item' + (m.selected ? ' selected' : '') + (!m.legal ? ' illegal' : '');
+
+    let tag = '';
+    if (m.selected) tag = '<span class="move-tag selected-tag">选择</span>';
+    else if (m.legal) tag = '<span class="move-tag legal-tag">合法</span>';
+    else tag = '<span class="move-tag illegal-tag">非法</span>';
+
+    li.innerHTML = `
+      <span class="move-rank">${i + 1}</span>
+      <span class="move-label">${m.label}</span>
+      <span class="move-prob">${(m.prob * 100).toFixed(1)}%</span>
+      <div class="move-bar"><div class="move-bar-fill" style="width:${m.prob * 100 / (analysis.top_moves[0]?.prob || 1) * 100}%"></div></div>
+      ${tag}
+    `;
+    list.appendChild(li);
+  }
+}
+
+function showGameResult(winner) {
+  const el = document.getElementById('game-result');
+  el.classList.add('show');
+  if (winner === 1) {
+    el.className = 'game-result show red-win';
+    el.textContent = '红方胜！';
+  } else if (winner === -1) {
+    el.className = 'game-result show black-win';
+    el.textContent = '黑方胜！';
+  } else {
+    el.className = 'game-result show draw';
+    el.textContent = '和棋';
+  }
+}
+
+function addHistory(player, text) {
+  const list = document.getElementById('history-list');
+  if (moveHistory.length === 0) list.innerHTML = '';
+  const n = moveHistory.length + 1;
+  const side = player === 1 ? '红' : '黑';
+  const item = document.createElement('div');
+  item.className = 'history-item';
+  item.textContent = `${n}. [${side}] ${text}`;
+  list.appendChild(item);
+  list.scrollTop = list.scrollHeight;
+  moveHistory.push({ player, text });
+}
+
+function selectSide(side) {
+  humanSide = side === 'red' ? 1 : -1;
+  flipped = (humanSide === 1); // 执红翻转（红方row=0在下方），执黑不翻转（黑方row=9在下方）
+  document.getElementById('side-red').className = 'side-btn' + (side === 'red' ? ' active-red' : '');
+  document.getElementById('side-black').className = 'side-btn' + (side === 'black' ? ' active-black' : '');
+  render();
+}
+
+// ============================================================
+// API调用
+// ============================================================
+async function loadModels() {
+  try {
+    const resp = await fetch('/api/models');
+    const data = await resp.json();
+    const sel = document.getElementById('model-select');
+    sel.innerHTML = '';
+    if (data.models.length === 0) {
+      sel.innerHTML = '<option value="">无可用模型</option>';
+      return;
+    }
+    for (const m of data.models) {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      opt.textContent = `${m.name} (${m.size_mb}MB)`;
+      if (m.name === data.current) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  } catch (e) {
+    console.error('加载模型列表失败:', e);
+  }
+}
+
+async function loadModel() {
+  const modelName = document.getElementById('model-select').value;
+  if (!modelName) { alert('请选择模型'); return; }
+
+  showLoading('正在加载模型...');
+  try {
+    const resp = await fetch('/api/load_model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_name: modelName }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      alert('加载失败: ' + data.error);
+    } else {
+      document.getElementById('status-dot').className = 'dot loaded';
+      document.getElementById('status-text').textContent = `已加载: ${data.model_name}`;
+    }
+  } catch (e) {
+    alert('加载失败: ' + e.message);
+  }
+  hideLoading();
+}
+
+async function newGame() {
+  const sims = parseInt(document.getElementById('simulations').value) || 500;
+  const side = humanSide === 1 ? 'red' : 'black';
+
+  showLoading('开始新游戏...');
+  try {
+    const resp = await fetch('/api/new_game', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ human_side: side, num_simulations: sims }),
+    });
+    const data = await resp.json();
+
+    board = data.board;
+    currentPlayer = data.current_player;
+    humanSide = data.human_side;
+    flipped = (humanSide === 1); // 执红翻转，执黑不翻转
+    gameOver = false;
+    selectedPiece = null;
+    validMoves = [];
+    lastAiMove = null;
+    lastHumanMove = null;
+    moveHistory = [];
+
+    // 更新执子按钮
+    document.getElementById('side-red').className = 'side-btn' + (humanSide === 1 ? ' active-red' : '');
+    document.getElementById('side-black').className = 'side-btn' + (humanSide === -1 ? ' active-black' : '');
+
+    // 隐藏游戏结果
+    document.getElementById('game-result').classList.remove('show');
+    // 重置历史
+    document.getElementById('history-list').innerHTML = '<div style="color:#666; font-size:13px; text-align:center; padding:10px;">暂无记录</div>';
+    // 重置分析
+    document.getElementById('no-analysis').style.display = 'block';
+    document.getElementById('analysis-content').style.display = 'none';
+
+    // 如果AI先手
+    if (data.ai_move) {
+      lastAiMove = data.ai_move;
+      addHistory(-humanSide, data.ai_move.label || 'AI走棋');
+      if (data.ai_analysis) updateAnalysis(data.ai_analysis);
+    }
+
+    render();
+    updateTurnInfo();
+  } catch (e) {
+    alert('开始游戏失败: ' + e.message);
+  }
+  hideLoading();
+}
+
+function showLoading(text) {
+  document.getElementById('loading-text').textContent = text || '加载中...';
+  document.getElementById('loading').classList.add('show');
+}
+function hideLoading() {
+  document.getElementById('loading').classList.remove('show');
+}
+
+// ============================================================
+// 初始化
+// ============================================================
+window.addEventListener('load', () => {
+  render();
+  loadModels();
+});
+</script>
+</body>
+</html>
